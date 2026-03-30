@@ -1,6 +1,6 @@
-use ls_qpack::decoder::Decoder;
-use ls_qpack::encoder::Encoder;
-use ls_qpack::StreamId;
+use ls_qpack_rs::decoder::Decoder;
+use ls_qpack_rs::encoder::Encoder;
+use ls_qpack_rs::StreamId;
 
 const HEADERS: [(&str, &str); 3] = [(":status", "404"), ("foo", "bar"), ("foo", "bar")];
 

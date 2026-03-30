@@ -1,8 +1,8 @@
 // Copyright 2022 Biagio Festa
 
 use std::convert::TryFrom;
-use std::fmt::Debug;
 use std::ffi::c_char;
+use std::fmt::Debug;
 
 /// Error during Header construction.
 pub enum HeaderError {
@@ -32,7 +32,7 @@ impl Header {
     ///
     /// # Example
     /// ```
-    /// use ls_qpack::Header;
+    /// use ls_qpack_rs::Header;
     ///
     /// let header = Header::new("name", "bob");
     /// ```
@@ -59,7 +59,7 @@ impl Header {
         let name_offset = 0;
         let name_len = name.len();
         let value_offset = name.len();
-        let value_len = value.len(); // TODO(bfesta): what if foffset + len?
+        let value_len = value.len();
 
         Ok(Self {
             buffer: buffer.into_boxed_slice(),
@@ -73,31 +73,21 @@ impl Header {
     /// Returns the `name` field.
     #[inline]
     pub fn name(&self) -> &str {
-        debug_assert!(std::str::from_utf8(
-            &self.buffer[self.name_offset..self.name_offset + self.name_len]
-        )
-        .is_ok());
-
-        unsafe {
-            std::str::from_utf8_unchecked(
-                &self.buffer[self.name_offset..self.name_offset + self.name_len],
-            )
-        }
+        // UTF-8 validity is guaranteed at construction time: `new()` takes `AsRef<str>` and
+        // `with_buffer()` validates with `std::str::from_utf8`. We use the checked version
+        // here as a defense-in-depth measure, avoiding `unsafe`.
+        std::str::from_utf8(&self.buffer[self.name_offset..self.name_offset + self.name_len])
+            .expect("Header name must be valid UTF-8 (validated at construction)")
     }
 
     /// Returns the `value` field.
     #[inline]
     pub fn value(&self) -> &str {
-        debug_assert!(std::str::from_utf8(
-            &self.buffer[self.value_offset..self.value_offset + self.value_len]
-        )
-        .is_ok());
-
-        unsafe {
-            std::str::from_utf8_unchecked(
-                &self.buffer[self.value_offset..self.value_offset + self.value_len],
-            )
-        }
+        // UTF-8 validity is guaranteed at construction time: `new()` takes `AsRef<str>` and
+        // `with_buffer()` validates with `std::str::from_utf8`. We use the checked version
+        // here as a defense-in-depth measure, avoiding `unsafe`.
+        std::str::from_utf8(&self.buffer[self.value_offset..self.value_offset + self.value_len])
+            .expect("Header value must be valid UTF-8 (validated at construction)")
     }
 
     pub(crate) fn with_buffer(
@@ -135,8 +125,7 @@ impl Header {
         })
     }
 
-    // TODO(bfesta): useless function?
-    pub(crate) fn build_lsxpack_header(&mut self) -> LsxpackHeader {
+    pub(crate) fn build_lsxpack_header(&mut self) -> LsxpackHeader<'_> {
         LsxpackHeader::new(self)
     }
 }
@@ -154,7 +143,7 @@ impl Debug for Header {
 ///
 /// # Examples
 /// ```
-/// use ls_qpack::TryIntoHeader;
+/// use ls_qpack_rs::TryIntoHeader;
 ///
 /// let header = ("name", "bob").try_into_header();
 /// ```
@@ -185,7 +174,7 @@ where
 }
 
 pub(crate) struct LsxpackHeader<'a> {
-    header_sys: ls_qpack_sys::lsxpack_header,
+    header_sys: ls_qpack_rs_sys::lsxpack_header,
     #[allow(unused)]
     header_ref: &'a mut Header,
 }
@@ -197,7 +186,7 @@ impl<'a> LsxpackHeader<'a> {
         debug_assert!(header.value_offset < u16::MAX as usize);
         debug_assert!(header.value_len < Header::MAX_LEN_VALUE);
 
-        let header_sys = ls_qpack_sys::lsxpack_header {
+        let header_sys = ls_qpack_rs_sys::lsxpack_header {
             buf: header.buffer.as_mut_ptr() as *mut c_char,
             name_offset: header.name_offset as i32,
             name_len: header.name_len as u16,
@@ -213,8 +202,8 @@ impl<'a> LsxpackHeader<'a> {
     }
 }
 
-impl<'a> AsRef<ls_qpack_sys::lsxpack_header> for LsxpackHeader<'a> {
-    fn as_ref(&self) -> &ls_qpack_sys::lsxpack_header {
+impl AsRef<ls_qpack_rs_sys::lsxpack_header> for LsxpackHeader<'_> {
+    fn as_ref(&self) -> &ls_qpack_rs_sys::lsxpack_header {
         &self.header_sys
     }
 }

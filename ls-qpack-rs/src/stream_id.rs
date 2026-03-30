@@ -6,7 +6,7 @@
 ///
 /// # Examples
 /// ```
-/// # use ls_qpack::StreamId;
+/// # use ls_qpack_rs::StreamId;
 /// let stream_id = StreamId::new(64);
 /// assert_eq!(stream_id.value(), 64);
 /// ```

@@ -8,8 +8,8 @@
 //!
 //! ## Only Static Table
 //! ```
-//! use ls_qpack::encoder::Encoder;
-//! use ls_qpack::StreamId;
+//! use ls_qpack_rs::encoder::Encoder;
+//! use ls_qpack_rs::StreamId;
 //!
 //! let (enc_hdr, enc_stream) = Encoder::new()
 //!     .encode_all(
@@ -31,8 +31,37 @@ use std::fmt::Display;
 use std::marker::PhantomPinned;
 use std::pin::Pin;
 
+/// The kind of encoder error that occurred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EncoderErrorKind {
+    /// The header could not be converted (e.g., invalid UTF-8 or too long).
+    InvalidHeader,
+    /// The C encoder returned an error during initialization.
+    InitFailed,
+    /// The C encoder returned an error during encoding.
+    EncodeFailed,
+    /// The C encoder failed to finalize the header block.
+    EndHeaderFailed,
+    /// The C encoder returned an error when processing decoder stream data.
+    FeedFailed,
+}
+
 /// Error during encoding operations.
-pub struct EncoderError;
+pub struct EncoderError {
+    kind: EncoderErrorKind,
+}
+
+impl EncoderError {
+    /// Returns the kind of encoder error.
+    pub fn kind(&self) -> EncoderErrorKind {
+        self.kind
+    }
+
+    fn new(kind: EncoderErrorKind) -> Self {
+        Self { kind }
+    }
+}
 
 /// A QPACK encoder.
 pub struct Encoder {
@@ -84,8 +113,8 @@ impl Encoder {
     ///
     /// # Examples
     /// ```
-    /// use ls_qpack::encoder::Encoder;
-    /// use ls_qpack::StreamId;
+    /// use ls_qpack_rs::encoder::Encoder;
+    /// use ls_qpack_rs::StreamId;
     ///
     /// let mut encoder = Encoder::new();
     /// let (enc_hdr, enc_stream) = encoder
@@ -123,8 +152,8 @@ impl Encoder {
     ///
     /// # Examples
     /// ```
-    /// use ls_qpack::encoder::Encoder;
-    /// use ls_qpack::StreamId;
+    /// use ls_qpack_rs::encoder::Encoder;
+    /// use ls_qpack_rs::StreamId;
     ///
     /// let mut encoder = Encoder::new();
     /// let mut encoding_block = encoder.encoding(StreamId::new(0));
@@ -146,8 +175,8 @@ impl Encoder {
 
     /// Feeds data from decoder's buffer stream.
     pub fn feed<D>(&mut self, data: D) -> Result<(), EncoderError>
-        where
-            D: AsRef<[u8]>,
+    where
+        D: AsRef<[u8]>,
     {
         self.inner.as_mut().feed_decoder_data(data.as_ref())
     }
@@ -245,6 +274,7 @@ impl<'a> EncodingBlock<'a> {
 /// The result of the encoding operation.
 ///
 /// This is the result of [`Encoder::encode_all`] or [`EncodingBlock::encode`].
+#[derive(Debug)]
 pub struct BuffersEncoded {
     header: Box<[u8]>,
     stream: Box<[u8]>,
@@ -273,7 +303,7 @@ impl From<BuffersEncoded> for (Box<[u8]>, Box<[u8]>) {
 }
 
 struct InnerEncoder {
-    encoder: ls_qpack_sys::lsqpack_enc,
+    encoder: ls_qpack_rs_sys::lsqpack_enc,
     enc_buffer: Vec<u8>,
     hdr_buffer: Vec<u8>,
     _marker: PhantomPinned,
@@ -282,14 +312,17 @@ struct InnerEncoder {
 impl InnerEncoder {
     fn new() -> Pin<Box<Self>> {
         let mut this = Box::new(Self {
-            encoder: ls_qpack_sys::lsqpack_enc::default(),
+            encoder: ls_qpack_rs_sys::lsqpack_enc::default(),
             enc_buffer: Vec::new(),
             hdr_buffer: Vec::new(),
             _marker: PhantomPinned,
         });
 
+        // SAFETY: `this.encoder` is a valid, default-initialized `lsqpack_enc` struct.
+        // The null second argument indicates no logging context. `this` is a live Box
+        // allocation so `&mut this.encoder` is a valid pointer.
         unsafe {
-            ls_qpack_sys::lsqpack_enc_preinit(&mut this.encoder, std::ptr::null_mut());
+            ls_qpack_rs_sys::lsqpack_enc_preinit(&mut this.encoder, std::ptr::null_mut());
         }
 
         Box::into_pin(this)
@@ -301,19 +334,25 @@ impl InnerEncoder {
         dyn_table_size: u32,
         max_blocked_streams: u32,
     ) -> Result<Box<[u8]>, EncoderError> {
+        // SAFETY: We only access plain data fields (encoder, buffer, sdtc_buffer_size)
+        // through the unpinned reference — none of which are address-sensitive.
+        // The PhantomPinned marker is never moved.
         let this = unsafe { self.get_unchecked_mut() };
 
-        let mut buffer = vec![0; ls_qpack_sys::LSQPACK_LONGEST_SDTC as usize];
+        let mut buffer = vec![0; ls_qpack_rs_sys::LSQPACK_LONGEST_SDTC as usize];
         let mut sdtc_buffer_size = buffer.len();
 
+        // SAFETY: `this.encoder` was pre-initialized by `lsqpack_enc_preinit` in `new()`.
+        // The buffer is a freshly allocated Vec with `LSQPACK_LONGEST_SDTC` bytes of space.
+        // `sdtc_buffer_size` is set to the buffer's capacity. All pointer arguments are valid.
         let result = unsafe {
-            ls_qpack_sys::lsqpack_enc_init(
+            ls_qpack_rs_sys::lsqpack_enc_init(
                 &mut this.encoder,
                 std::ptr::null_mut(),
                 max_table_size,
                 dyn_table_size,
                 max_blocked_streams,
-                ls_qpack_sys::lsqpack_enc_opts_LSQPACK_ENC_OPT_STAGE_2,
+                ls_qpack_rs_sys::lsqpack_enc_opts_LSQPACK_ENC_OPT_STAGE_2,
                 buffer.as_mut_ptr(),
                 &mut sdtc_buffer_size,
             )
@@ -323,7 +362,7 @@ impl InnerEncoder {
             buffer.truncate(sdtc_buffer_size);
             Ok(buffer.into_boxed_slice())
         } else {
-            Err(EncoderError)
+            Err(EncoderError::new(EncoderErrorKind::InitFailed))
         }
     }
 
@@ -333,10 +372,13 @@ impl InnerEncoder {
         stream_id: StreamId,
         seqno: u32,
     ) -> Result<(), EncoderError> {
+        // SAFETY: We only access plain data fields — none are address-sensitive.
         let this = unsafe { self.get_unchecked_mut() };
 
+        // SAFETY: `this.encoder` is a fully initialized encoder (preinit was called in `new()`).
+        // `stream_id` and `seqno` are plain integer values.
         let result = unsafe {
-            ls_qpack_sys::lsqpack_enc_start_header(&mut this.encoder, stream_id.value(), seqno)
+            ls_qpack_rs_sys::lsqpack_enc_start_header(&mut this.encoder, stream_id.value(), seqno)
         };
 
         if result == 0 {
@@ -345,7 +387,7 @@ impl InnerEncoder {
 
             Ok(())
         } else {
-            Err(EncoderError)
+            Err(EncoderError::new(EncoderErrorKind::EncodeFailed))
         }
     }
 
@@ -355,12 +397,13 @@ impl InnerEncoder {
     {
         const BUFFER_SIZE: usize = 4096;
 
-        let mut header = header.try_into_header().map_err(|_| EncoderError)?;
+        let mut header = header
+            .try_into_header()
+            .map_err(|_| EncoderError::new(EncoderErrorKind::InvalidHeader))?;
 
+        // SAFETY: We only access plain data fields (encoder, enc_buffer, hdr_buffer)
+        // — none are address-sensitive.
         let this = unsafe { self.get_unchecked_mut() };
-
-        // TODO(bfesta): we want to better handle capacity.
-        // In particular, if the encoding op fails because of buffer too small we want report that, at least.
 
         let enc_buffer_offset = this.enc_buffer.len();
         this.enc_buffer.resize(enc_buffer_offset + BUFFER_SIZE, 0);
@@ -371,8 +414,12 @@ impl InnerEncoder {
         let mut enc_buffer_size = this.enc_buffer.len() - enc_buffer_offset;
         let mut hdr_buffer_size = this.hdr_buffer.len() - hdr_buffer_offset;
 
+        // SAFETY: `this.encoder` is initialized and a header block was started via
+        // `start_header_block`. The enc_buffer and hdr_buffer pointers are offset into
+        // valid Vec allocations with at least BUFFER_SIZE bytes of available space.
+        // `header.build_lsxpack_header()` returns a valid lsxpack_header reference.
         let result = unsafe {
-            ls_qpack_sys::lsqpack_enc_encode(
+            ls_qpack_rs_sys::lsqpack_enc_encode(
                 &mut this.encoder,
                 this.enc_buffer.as_mut_ptr().add(enc_buffer_offset),
                 &mut enc_buffer_size,
@@ -383,7 +430,7 @@ impl InnerEncoder {
             )
         };
 
-        if result == ls_qpack_sys::lsqpack_enc_status_LQES_OK {
+        if result == ls_qpack_rs_sys::lsqpack_enc_status_LQES_OK {
             this.enc_buffer
                 .truncate(enc_buffer_offset + enc_buffer_size);
             this.hdr_buffer
@@ -394,7 +441,7 @@ impl InnerEncoder {
             this.enc_buffer.truncate(enc_buffer_offset);
             this.hdr_buffer.truncate(hdr_buffer_offset);
 
-            Err(EncoderError)
+            Err(EncoderError::new(EncoderErrorKind::EncodeFailed))
         }
     }
 
@@ -405,15 +452,20 @@ impl InnerEncoder {
     ///   * Buffer of encoded header
     ///   * Buffer of encoded bytes to write on the encoder stream.
     fn end_header_block(self: Pin<&mut Self>) -> Result<(Vec<u8>, Vec<u8>), EncoderError> {
+        // SAFETY: We only access plain data fields — none are address-sensitive.
         let this = unsafe { self.get_unchecked_mut() };
 
+        // SAFETY: `this.encoder` is initialized and a header block is in progress.
+        // Reading the prefix size is a pure query with no side effects.
         let max_prefix_len =
-            unsafe { ls_qpack_sys::lsqpack_enc_header_block_prefix_size(&this.encoder) };
+            unsafe { ls_qpack_rs_sys::lsqpack_enc_header_block_prefix_size(&this.encoder) };
 
         let mut hdr_block = vec![0; max_prefix_len + this.hdr_buffer.len()];
 
+        // SAFETY: `hdr_block` has at least `max_prefix_len` bytes available.
+        // `this.encoder` has an active header block that was started and populated.
         let hdr_prefix_len = unsafe {
-            ls_qpack_sys::lsqpack_enc_end_header(
+            ls_qpack_rs_sys::lsqpack_enc_end_header(
                 &mut this.encoder,
                 hdr_block.as_mut_ptr(),
                 max_prefix_len,
@@ -427,44 +479,80 @@ impl InnerEncoder {
 
             Ok((hdr_block, std::mem::take(&mut this.enc_buffer)))
         } else {
-            Err(EncoderError)
+            Err(EncoderError::new(EncoderErrorKind::EndHeaderFailed))
         }
     }
 
     fn feed_decoder_data(self: Pin<&mut Self>, data: &[u8]) -> Result<(), EncoderError> {
+        // SAFETY: We only access plain data fields — none are address-sensitive.
         let this = unsafe { self.get_unchecked_mut() };
 
+        // SAFETY: `this.encoder` is initialized. `data.as_ptr()` and `data.len()` describe
+        // a valid byte slice. The C function reads exactly `data.len()` bytes.
         let result = unsafe {
-            ls_qpack_sys::lsqpack_enc_decoder_in(&mut this.encoder, data.as_ptr(), data.len())
+            ls_qpack_rs_sys::lsqpack_enc_decoder_in(&mut this.encoder, data.as_ptr(), data.len())
         };
 
         if result == 0 {
             Ok(())
         } else {
-            Err(EncoderError)
+            Err(EncoderError::new(EncoderErrorKind::FeedFailed))
         }
     }
 
     fn ratio(self: Pin<&Self>) -> f32 {
-        unsafe { ls_qpack_sys::lsqpack_enc_ratio(&self.encoder) }
+        // SAFETY: `self.encoder` is initialized. This is a read-only query.
+        unsafe { ls_qpack_rs_sys::lsqpack_enc_ratio(&self.encoder) }
     }
 }
 
 impl Drop for InnerEncoder {
     fn drop(&mut self) {
-        unsafe { ls_qpack_sys::lsqpack_enc_cleanup(&mut self.encoder) }
+        // SAFETY: `self.encoder` was initialized by `lsqpack_enc_preinit` (and possibly
+        // `lsqpack_enc_init`). `lsqpack_enc_cleanup` frees all resources owned by the
+        // C encoder. This is called exactly once during drop.
+        unsafe { ls_qpack_rs_sys::lsqpack_enc_cleanup(&mut self.encoder) }
     }
 }
 
+// SAFETY: The C `lsqpack_enc` struct is a self-contained state machine. It uses no
+// thread-local storage, no global mutable state, and no thread-affine resources. All
+// internal raw pointers reference memory owned by the struct itself (allocated during
+// init, freed during cleanup). It is safe to move an InnerEncoder to another thread.
+unsafe impl Send for InnerEncoder {}
+
+// SAFETY: All access to InnerEncoder goes through Pin<&mut Self> methods, meaning Rust's
+// borrow checker guarantees exclusive access. The public Encoder API only exposes &mut self
+// methods, so no concurrent &self access is possible. Shared references to the outer
+// Encoder cannot invoke any mutation on the C state.
+unsafe impl Sync for InnerEncoder {}
+
+const _: () = {
+    fn _assert_send<T: Send>() {}
+    fn _assert_sync<T: Sync>() {}
+    fn _assert_all() {
+        _assert_send::<Encoder>();
+        _assert_sync::<Encoder>();
+    }
+};
+
 impl Debug for EncoderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EncoderError").finish()
+        f.debug_struct("EncoderError")
+            .field("kind", &self.kind)
+            .finish()
     }
 }
 
 impl Display for EncoderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Debug::fmt(self, f)
+        match self.kind {
+            EncoderErrorKind::InvalidHeader => write!(f, "invalid header"),
+            EncoderErrorKind::InitFailed => write!(f, "encoder initialization failed"),
+            EncoderErrorKind::EncodeFailed => write!(f, "encoding operation failed"),
+            EncoderErrorKind::EndHeaderFailed => write!(f, "failed to finalize header block"),
+            EncoderErrorKind::FeedFailed => write!(f, "failed to process decoder stream data"),
+        }
     }
 }
 

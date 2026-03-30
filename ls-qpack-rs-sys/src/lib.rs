@@ -6,6 +6,7 @@ mod generated {
         non_upper_case_globals,
         non_snake_case,
         deref_nullptr,
+        unnecessary_transmutes,
         rustdoc::invalid_rust_codeblocks,
         clippy::useless_transmute,
         clippy::missing_safety_doc

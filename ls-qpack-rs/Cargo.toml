@@ -1,18 +1,15 @@
 [package]
-name = "ls-qpack-sys"
-version = "0.1.4"
+name = "ls-qpack-rs"
+version = "0.3.1"
 license = "MIT OR Apache-2.0"
 authors = ["Biagio Festa"]
 edition = "2021"
-description = "QPACK (RFC 9204) Rust binding to C library ls-qpack"
+description = "QPACK Field Compression for HTTP/3 (RFC 9204)"
 keywords = ["qpack", "quic", "http3", "rfc-9204", "network"]
 repository = "https://github.com/BiagioFesta/ls-qpack-rs"
 readme = "../README.md"
 workspace = ".."
 
-[build-dependencies]
-bindgen = "0.66.1"
-cmake = "0.1.50"
-
 [dependencies]
-libc = "0.2.159"
+libc = "0.2.171"
+ls-qpack-rs-sys = { version = "0.3.1", path = "../ls-qpack-rs-sys" }
