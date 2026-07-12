@@ -11,7 +11,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
 
-        if src_path.file_name().map_or(false, |n| n == ".git") {
+        if src_path.file_name().is_some_and(|n| n == ".git") {
             continue;
         }
 

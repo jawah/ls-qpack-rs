@@ -9,7 +9,8 @@ mod generated {
         unnecessary_transmutes,
         rustdoc::invalid_rust_codeblocks,
         clippy::useless_transmute,
-        clippy::missing_safety_doc
+        clippy::missing_safety_doc,
+        clippy::ptr_offset_with_cast
     )]
 
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
