@@ -46,6 +46,8 @@ pub enum DecoderErrorKind {
     FeedFailed,
     /// An error occurred while processing a decoded header (e.g., invalid UTF-8).
     InvalidHeader,
+    /// The encoded or cumulative decoded field section exceeds its limit.
+    FieldSectionTooLarge,
 }
 
 /// Error during decoding operations.
@@ -129,7 +131,24 @@ impl Decoder {
     /// And the max number of blocked streams.
     pub fn new(dyn_table_size: u32, max_blocked_streams: u32) -> Self {
         Self {
-            inner: InnerDecoder::new(dyn_table_size, max_blocked_streams),
+            inner: InnerDecoder::new(dyn_table_size, max_blocked_streams, None),
+        }
+    }
+
+    /// Creates a decoder with a cumulative per-field-section limit.
+    ///
+    /// Each decoded field costs its name length, value length, and 32 bytes
+    /// (RFC 9114 section 4.2.2). The check runs before retaining each field,
+    /// including when a blocked section resumes. Encoded blocks are separately
+    /// bounded to four times this limit plus 32 bytes, allowing for Huffman
+    /// expansion and the QPACK block prefix without unbounded input retention.
+    pub fn with_max_field_section_size(
+        dyn_table_size: u32,
+        max_blocked_streams: u32,
+        maximum: usize,
+    ) -> Self {
+        Self {
+            inner: InnerDecoder::new(dyn_table_size, max_blocked_streams, Some(maximum)),
         }
     }
 
@@ -186,14 +205,20 @@ impl Decoder {
 struct InnerDecoder {
     decoder: ls_qpack_rs_sys::lsqpack_dec,
     header_blocks: HashMap<StreamId, Pin<Box<callbacks::HeaderBlockCtx>>>,
+    max_field_section_size: Option<usize>,
     _marker: PhantomPinned,
 }
 
 impl InnerDecoder {
-    fn new(dyn_table_size: u32, max_blocked_streams: u32) -> Pin<Box<Self>> {
+    fn new(
+        dyn_table_size: u32,
+        max_blocked_streams: u32,
+        max_field_section_size: Option<usize>,
+    ) -> Pin<Box<Self>> {
         let mut this = Box::new(Self {
             decoder: ls_qpack_rs_sys::lsqpack_dec::default(),
             header_blocks: HashMap::new(),
+            max_field_section_size,
             _marker: PhantomPinned,
         });
 
@@ -228,8 +253,20 @@ impl InnerDecoder {
             return Err(DecoderError::new(DecoderErrorKind::DuplicateStreamId));
         }
 
-        let mut hblock_ctx =
-            callbacks::HeaderBlockCtx::new(&mut this.decoder, data.to_vec().into_boxed_slice());
+        if data.is_empty() {
+            return Err(DecoderError::new(DecoderErrorKind::DecodeFailed));
+        }
+        if this
+            .max_field_section_size
+            .is_some_and(|maximum| data.len() > maximum.saturating_mul(4).saturating_add(32))
+        {
+            return Err(DecoderError::new(DecoderErrorKind::FieldSectionTooLarge));
+        }
+        let mut hblock_ctx = callbacks::HeaderBlockCtx::new(
+            &mut this.decoder,
+            data.to_vec().into_boxed_slice(),
+            this.max_field_section_size,
+        );
 
         let encoded_cursor = hblock_ctx.as_ref().encoded_cursor();
         let encoded_cursor_len = encoded_cursor.len();
@@ -264,10 +301,11 @@ impl InnerDecoder {
                 // SAFETY: Decoding is complete (LQRHS_DONE), so the C library no longer holds
                 // references into hblock_ctx. It is safe to unpin and consume it.
                 let hblock_ctx = unsafe { Pin::into_inner_unchecked(hblock_ctx) };
+                let (headers, _) = hblock_ctx.into_decoded();
 
                 buffer.truncate(sdtc_buffer_size);
                 Ok(DecoderOutput::Done(BuffersDecoded {
-                    headers: hblock_ctx.decoded_headers(),
+                    headers,
                     stream: buffer.into_boxed_slice(),
                 }))
             }
@@ -288,7 +326,12 @@ impl InnerDecoder {
                 Ok(DecoderOutput::BlockedStream)
             }
 
-            _ => Err(DecoderError::new(DecoderErrorKind::DecodeFailed)),
+            _ => Err(DecoderError::new(
+                hblock_ctx
+                    .as_ref()
+                    .error_kind()
+                    .unwrap_or(DecoderErrorKind::DecodeFailed),
+            )),
         }
     }
 
@@ -325,18 +368,19 @@ impl InnerDecoder {
 
                 let hdbk = hdbk.remove();
 
-                if hdbk.as_ref().is_error() {
+                if let Some(kind) = hdbk.as_ref().error_kind() {
                     debug_assert!(!hdbk.as_ref().is_blocked());
-                    return Some(Err(DecoderError::new(DecoderErrorKind::InvalidHeader)));
+                    return Some(Err(DecoderError::new(kind)));
                 }
 
                 // SAFETY: The header block is neither blocked nor in error, meaning the C
                 // library has finished processing it and no longer holds references to it.
                 // It is safe to unpin and consume it.
                 let hdbk = unsafe { Pin::into_inner_unchecked(hdbk) };
+                let (headers, stream_data) = hdbk.into_decoded();
                 Some(Ok(DecoderOutput::Done(BuffersDecoded {
-                    headers: hdbk.decoded_headers(),
-                    stream: hdbk.stream_data().into_boxed_slice(),
+                    headers,
+                    stream: stream_data.into_boxed_slice(),
                 })))
             }
 
@@ -377,7 +421,7 @@ const _: () = {
 };
 
 mod callbacks {
-    use crate::header::HeaderError;
+    use super::DecoderErrorKind;
     use crate::Header;
     use std::ffi::c_char;
     use std::marker::PhantomPinned;
@@ -398,7 +442,9 @@ mod callbacks {
         decoding_buffer: Vec<u8>,
         header: ls_qpack_rs_sys::lsxpack_header,
         blocked: bool,
-        error: bool,
+        error: Option<DecoderErrorKind>,
+        max_field_section_size: Option<usize>,
+        field_section_size: usize,
         stream_data: Vec<u8>,
         decoded_headers: Vec<Header>,
         _marker: PhantomPinned,
@@ -408,6 +454,7 @@ mod callbacks {
         pub(super) fn new(
             decoder: *mut ls_qpack_rs_sys::lsqpack_dec,
             encoded_data: Box<[u8]>,
+            max_field_section_size: Option<usize>,
         ) -> Pin<Box<Self>> {
             debug_assert!(!decoder.is_null());
 
@@ -419,7 +466,9 @@ mod callbacks {
                 stream_data: Vec::new(),
                 header: Default::default(),
                 blocked: false,
-                error: false,
+                error: None,
+                max_field_section_size,
+                field_section_size: 0,
                 decoded_headers: Default::default(),
                 _marker: PhantomPinned,
             })
@@ -452,17 +501,31 @@ mod callbacks {
             this.blocked = blocked;
         }
 
-        pub(super) fn set_stream_data(self: Pin<&mut Self>, data: &[u8]) {
+        pub(super) fn set_stream_data(self: Pin<&mut Self>, data: Vec<u8>) {
             // SAFETY: `stream_data` is an owned Vec — not address-sensitive.
             let this = unsafe { self.get_unchecked_mut() };
-            this.stream_data = data.to_vec();
+            this.stream_data = data;
         }
 
-        pub(super) fn enable_error(self: Pin<&mut Self>) {
-            // SAFETY: `error` is a plain bool — not address-sensitive.
+        pub(super) fn enable_error(self: Pin<&mut Self>, kind: DecoderErrorKind) {
+            // SAFETY: error metadata is not address-sensitive. A failed header
+            // callback and its enclosing C call can report the same error.
             let this = unsafe { self.get_unchecked_mut() };
-            debug_assert!(!this.error);
-            this.error = true;
+            if this.error.is_none() {
+                this.error = Some(kind);
+            }
+        }
+
+        pub(super) fn error_kind(self: Pin<&Self>) -> Option<DecoderErrorKind> {
+            self.error
+        }
+
+        fn can_start_header(&self) -> bool {
+            self.field_section_size.checked_add(32).is_some_and(|size| {
+                !self
+                    .max_field_section_size
+                    .is_some_and(|maximum| size > maximum)
+            })
         }
 
         pub(super) fn is_blocked(self: Pin<&Self>) -> bool {
@@ -470,15 +533,13 @@ mod callbacks {
         }
 
         pub(super) fn is_error(self: Pin<&Self>) -> bool {
-            self.error
+            self.error.is_some()
         }
 
-        pub(super) fn decoded_headers(&self) -> Vec<Header> {
-            self.decoded_headers.clone()
-        }
-
-        pub(super) fn stream_data(&self) -> Vec<u8> {
-            self.stream_data.clone()
+        // Only called after decoding is complete and the context is unpinned:
+        // the C decoder no longer retains pointers into this allocation.
+        pub(super) fn into_decoded(self) -> (Vec<Header>, Vec<u8>) {
+            (self.decoded_headers, self.stream_data)
         }
 
         /// Converts a `*mut c_void` (from C callbacks) back to a `Pin<&mut Self>`.
@@ -529,19 +590,39 @@ mod callbacks {
             &mut this.header
         }
 
-        fn process_header(self: Pin<&mut Self>) -> Result<(), HeaderError> {
+        fn process_header(self: Pin<&mut Self>) -> Result<(), DecoderErrorKind> {
             // SAFETY: We access `decoding_buffer`, `header`, and `decoded_headers` — all
             // owned data fields that are not address-sensitive.
             let this = unsafe { self.get_unchecked_mut() };
 
+            let size = this
+                .field_section_size
+                .checked_add(32)
+                .and_then(|size| size.checked_add(this.header.name_len as usize))
+                .and_then(|size| size.checked_add(this.header.val_len as usize));
+            let size = match size {
+                Some(size)
+                    if !this
+                        .max_field_section_size
+                        .is_some_and(|maximum| size > maximum) =>
+                {
+                    size
+                }
+                _ => return Err(DecoderErrorKind::FieldSectionTooLarge),
+            };
+
+            // A single field's scratch is bounded by MAX_SPACE in the prepare
+            // callback. Do not retain it until its actual decoded size fits.
             let header = Header::with_buffer(
                 std::mem::take(&mut this.decoding_buffer).into_boxed_slice(),
                 this.header.name_offset as usize,
                 this.header.name_len as usize,
                 this.header.val_offset as usize,
                 this.header.val_len as usize,
-            )?;
+            )
+            .map_err(|_| DecoderErrorKind::InvalidHeader)?;
 
+            this.field_section_size = size;
             this.decoded_headers.push(header);
 
             this.header = Default::default();
@@ -594,7 +675,7 @@ mod callbacks {
         match result {
             ls_qpack_rs_sys::lsqpack_read_header_status_LQRHS_DONE => {
                 buffer.truncate(sdtc_buffer_size);
-                hblock_ctx.as_mut().set_stream_data(&buffer);
+                hblock_ctx.as_mut().set_stream_data(buffer);
             }
 
             ls_qpack_rs_sys::lsqpack_read_header_status_LQRHS_BLOCKED
@@ -613,7 +694,9 @@ mod callbacks {
             }
 
             _ => {
-                hblock_ctx.as_mut().enable_error();
+                hblock_ctx
+                    .as_mut()
+                    .enable_error(DecoderErrorKind::InvalidHeader);
             }
         }
     }
@@ -638,6 +721,14 @@ mod callbacks {
         let space = space as u16;
 
         if header.is_null() {
+            // Even empty fields cost 32 bytes. Refuse the next allocation when
+            // no field can fit, rather than expanding an entire header bomb.
+            if !hblock_ctx.can_start_header() {
+                hblock_ctx
+                    .as_mut()
+                    .enable_error(DecoderErrorKind::FieldSectionTooLarge);
+                return std::ptr::null_mut();
+            }
             hblock_ctx.as_mut().reset_header();
         } else {
             assert!(std::ptr::eq(&hblock_ctx.header, header));
@@ -661,8 +752,8 @@ mod callbacks {
 
         match hblock_ctx.as_mut().process_header() {
             Ok(()) => 0,
-            Err(_) => {
-                hblock_ctx.as_mut().enable_error();
+            Err(kind) => {
+                hblock_ctx.as_mut().enable_error(kind);
                 -1
             }
         }
@@ -687,6 +778,9 @@ impl Display for DecoderError {
             DecoderErrorKind::FeedFailed => write!(f, "failed to process encoder stream data"),
             DecoderErrorKind::InvalidHeader => {
                 write!(f, "invalid header encountered during decoding")
+            }
+            DecoderErrorKind::FieldSectionTooLarge => {
+                write!(f, "QPACK field section exceeds the configured limit")
             }
         }
     }
@@ -984,5 +1078,189 @@ mod tests {
         assert_eq!(decoded.headers().len(), 1);
         assert_eq!(decoded.headers()[0].name(), ":method");
         assert_eq!(decoded.headers()[0].value(), "GET");
+    }
+
+    #[test]
+    fn completed_headers_outlive_decoder_reuse() {
+        let mut encoder = Encoder::new();
+        let mut decoder = Decoder::new(0, 0);
+        let mut decoded = Vec::new();
+        for id in 0..4 {
+            let value = format!("owned-header-value-{}", id);
+            let encoded = encoder
+                .encode_all(StreamId::new(id), [("x-owned", value.as_str())])
+                .unwrap();
+            decoded.push(
+                decoder
+                    .decode(StreamId::new(id), encoded.header())
+                    .unwrap()
+                    .take()
+                    .unwrap(),
+            );
+        }
+        drop(decoder);
+        drop(encoder);
+        for (id, block) in decoded.iter().enumerate() {
+            assert_eq!(block.headers()[0].name(), "x-owned");
+            assert_eq!(
+                block.headers()[0].value(),
+                format!("owned-header-value-{}", id)
+            );
+        }
+    }
+
+    #[test]
+    fn unblocked_headers_and_ack_outlive_decoder() {
+        let mut decoder = Decoder::new(4096, 100);
+        // A header block referencing an insertion which has not arrived yet.
+        let block = [0x02, 0x80, 0xd9, 0x10];
+        assert!(decoder
+            .decode(StreamId::new(0), block)
+            .unwrap()
+            .is_blocked());
+        let instructions = [
+            0x3f, 0xe1, 0x01, 0xc6, 0x96, 0xd0, 0x7a, 0xbe, 0x94, 0x10, 0x94, 0xcb, 0x6d, 0x0a,
+            0x08, 0x01, 0x7d, 0x40, 0x39, 0x71, 0x96, 0x6e, 0x32, 0xca, 0x98, 0xb4, 0x6f,
+        ];
+        for byte in instructions {
+            decoder.feed([byte]).unwrap();
+        }
+        let decoded = decoder
+            .unblocked(StreamId::new(0))
+            .unwrap()
+            .unwrap()
+            .take()
+            .unwrap();
+        assert!(decoder.unblocked(StreamId::new(0)).is_none());
+        drop(decoder);
+        assert_eq!(decoded.headers()[0].name(), ":status");
+        assert_eq!(decoded.headers()[0].value(), "200");
+        assert_eq!(decoded.headers()[1].name(), "date");
+        assert_eq!(
+            decoded.headers()[1].value(),
+            "Mon, 22 Jul 2019 06:33:33 GMT"
+        );
+        assert!(!decoded.stream().is_empty());
+    }
+
+    #[test]
+    fn field_section_limit_counts_bytes_and_per_field_overhead() {
+        let encoded = Encoder::new()
+            .encode_all(StreamId::new(0), [("x", ""), ("y", "")])
+            .unwrap();
+        let mut exact = Decoder::with_max_field_section_size(0, 0, 66);
+        assert_eq!(
+            exact
+                .decode(StreamId::new(0), encoded.header())
+                .unwrap()
+                .take()
+                .unwrap()
+                .headers()
+                .len(),
+            2
+        );
+        for maximum in [0, 2, 32, 65] {
+            let error = Decoder::with_max_field_section_size(0, 0, maximum)
+                .decode(StreamId::new(0), encoded.header())
+                .unwrap_err();
+            assert_eq!(error.kind(), DecoderErrorKind::FieldSectionTooLarge);
+        }
+        let encoded = Encoder::new()
+            .encode_all(StreamId::new(0), [("x", "é")])
+            .unwrap();
+        assert!(Decoder::with_max_field_section_size(0, 0, 35)
+            .decode(StreamId::new(0), encoded.header())
+            .is_ok());
+        assert_eq!(
+            Decoder::with_max_field_section_size(0, 0, 34)
+                .decode(StreamId::new(0), encoded.header())
+                .unwrap_err()
+                .kind(),
+            DecoderErrorKind::FieldSectionTooLarge
+        );
+    }
+
+    #[test]
+    fn repeated_static_references_stop_at_the_decoded_limit() {
+        let mut encoded = vec![0, 0];
+        encoded.resize(1002, 0xfa);
+        // The encoded block fits, but expanding all references would not.
+        let error = Decoder::with_max_field_section_size(0, 0, 1024)
+            .decode(StreamId::new(0), &encoded)
+            .unwrap_err();
+        assert_eq!(error.kind(), DecoderErrorKind::FieldSectionTooLarge);
+        assert_eq!(
+            Decoder::new(0, 0)
+                .decode(StreamId::new(0), &encoded)
+                .unwrap()
+                .take()
+                .unwrap()
+                .headers()
+                .len(),
+            1000
+        );
+    }
+
+    #[test]
+    fn limit_is_per_section_and_errors_do_not_retain_stream_ids() {
+        let encoded = Encoder::new()
+            .encode_all(StreamId::new(0), [("x", "")])
+            .unwrap();
+        let mut decoder = Decoder::with_max_field_section_size(0, 0, 33);
+        for id in [0, 4, 8] {
+            assert!(decoder.decode(StreamId::new(id), encoded.header()).is_ok());
+        }
+        let excessive = Encoder::new()
+            .encode_all(StreamId::new(12), [("x", ""), ("y", "")])
+            .unwrap();
+        assert_eq!(
+            decoder
+                .decode(StreamId::new(12), excessive.header())
+                .unwrap_err()
+                .kind(),
+            DecoderErrorKind::FieldSectionTooLarge
+        );
+        assert!(decoder.unblocked(StreamId::new(12)).is_none());
+        assert!(decoder.decode(StreamId::new(16), encoded.header()).is_ok());
+    }
+
+    #[test]
+    fn blocked_sections_keep_their_limit_when_resumed() {
+        let mut decoder = Decoder::with_max_field_section_size(4096, 100, 42);
+        let block = [0x02, 0x80, 0xd9, 0x10];
+        assert!(decoder
+            .decode(StreamId::new(0), block)
+            .unwrap()
+            .is_blocked());
+        let instructions = [
+            0x3f, 0xe1, 0x01, 0xc6, 0x96, 0xd0, 0x7a, 0xbe, 0x94, 0x10, 0x94, 0xcb, 0x6d, 0x0a,
+            0x08, 0x01, 0x7d, 0x40, 0x39, 0x71, 0x96, 0x6e, 0x32, 0xca, 0x98, 0xb4, 0x6f,
+        ];
+        for byte in instructions {
+            decoder.feed([byte]).unwrap();
+        }
+        assert_eq!(
+            decoder
+                .unblocked(StreamId::new(0))
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            DecoderErrorKind::FieldSectionTooLarge
+        );
+        assert!(decoder.unblocked(StreamId::new(0)).is_none());
+    }
+
+    #[test]
+    fn oversized_encoded_blocks_are_rejected_before_retention() {
+        let mut decoder = Decoder::with_max_field_section_size(0, 0, 64);
+        let oversized = vec![0; 64 * 4 + 33];
+        assert_eq!(
+            decoder
+                .decode(StreamId::new(0), oversized)
+                .unwrap_err()
+                .kind(),
+            DecoderErrorKind::FieldSectionTooLarge
+        );
+        assert!(decoder.unblocked(StreamId::new(0)).is_none());
     }
 }

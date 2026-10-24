@@ -39,3 +39,20 @@ fn main() {
     println!("Decoded header: {:?}", decoded_headers);
 }
 ```
+
+
+## Limiting untrusted field sections
+
+HTTP/3 endpoints accepting untrusted header blocks should use
+`Decoder::with_max_field_section_size(table_capacity, blocked_streams, maximum)`
+and advertise the same decoded limit in `SETTINGS_MAX_FIELD_SECTION_SIZE`.
+The limit counts each name and value in bytes plus the RFC 9114 overhead of
+32 bytes per field. It is checked incrementally before retaining fields and
+is preserved when a blocked section resumes. An excessive section returns
+`DecoderErrorKind::FieldSectionTooLarge`.
+
+Encoded header blocks are also bounded to `4 * maximum + 32` bytes, allowing
+for Huffman encodings and the QPACK prefix. Temporary decoding scratch for one
+field remains bounded by the existing 65535-byte maximum. `Decoder::new` keeps
+its previous unbounded field-section behavior for callers managing their own
+limits; a dynamic-table size limit alone does not bound header expansion.

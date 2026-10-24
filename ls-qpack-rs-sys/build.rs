@@ -67,6 +67,11 @@ fn main() {
     // Generate bindings (use headers from the patched source tree since
     // cmake installs may not copy all headers we need)
     let bindings = bindgen::Builder::default()
+        // Keep the QPACK API and its dependent types, excluding incidental
+        // libc declarations such as memcpy/strlen pulled in by C headers.
+        .allowlist_function("(lsqpack|lsxpack)_.*")
+        .allowlist_type("(lsqpack|lsxpack)_.*")
+        .allowlist_var("(LSQPACK|LSXPACK)_.*")
         .derive_debug(true)
         .derive_default(true)
         .size_t_is_usize(true)
